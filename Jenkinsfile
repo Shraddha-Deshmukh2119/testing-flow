@@ -22,7 +22,7 @@ pipeline {
     }
 
     stages {
-        stage('Checkout') {
+        stage('CheckoutRepo') {
             steps {
                 script {
                     if (params.REPO_MODE == 'SINGLE_REPO') {
