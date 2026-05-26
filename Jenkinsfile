@@ -6,11 +6,11 @@ pipeline {
     }
 
     parameters {
-        choice(name: 'REPO_MODE', choices: ['SEPARATE_REPOS', 'SINGLE_REPO'], description: 'Choose your repository structure')
+        choice(name: 'REPO_MODE', choices: ['SEPARATE_REPOS'], description: 'Choose your repository structure')
         string(name: 'COMBINED_REPO_URL', defaultValue: '', description: 'URL for single repo')
         string(name: 'JAVA_REPO_URL', defaultValue: 'https://github.com/Shraddha-Deshmukh2119/java-repo.git', description: 'Java repo URL')
         string(name: 'CPP_REPO_URL', defaultValue: 'https://github.com/Shraddha-Deshmukh2119/Cpp-repo.git', description: 'C++ repo URL')
-        string(name: 'SCRIPT_PATH', defaultValue: 'C:\\jenkins-scripts\\unify_reports.py', description: 'Path to Python script')
+        string(name: 'SCRIPT_PATH', defaultValue: 'D:\\jenkins-scripts\\unify_reports.py', description: 'Path to Python script')
         string(name: 'SONAR_ORG_KEY', defaultValue: 'loosely-coupled-key', description: 'SonarCloud Org')
         string(name: 'SONAR_PROJECT_KEY', defaultValue: 'loosely-coupled-key_unified-system-analysis', description: 'SonarCloud Project')
     }
