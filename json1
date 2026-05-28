@@ -1,0 +1,360 @@
+import os
+import json
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+def fetch_sonarcloud_data():
+    """
+    Fetches rich component measures and outstanding code issues from SonarCloud 
+    using the official REST API endpoint, capturing detailed rule impact and metadata.
+    """
+    token = os.environ.get("SONAR_TOKEN", "")
+    project_key = os.environ.get("SONAR_PROJECT_KEY", "")
+    
+    metric_keys = (
+        "coverage,branch_coverage,tests,test_failures,test_errors,skipped_tests,"
+        "test_execution_time,bugs,vulnerabilities,code_smells,security_hotspots,"
+        "security_rating,reliability_rating,sqale_rating,sqale_index,duplicated_lines,"
+        "duplicated_blocks,duplicated_lines_density,quality_gate_details"
+    )
+    
+    sonar_data = {
+        "summary": {
+            "overallLineCoverage": 0.0, "overallBranchCoverage": 0.0,
+            "bugs": 0, "vulnerabilities": 0, "codeSmells": 0, "securityHotspots": 0,
+            "securityRating": "A", "reliabilityRating": "A", "maintainabilityRating": "A",
+            "technicalDebtMinutes": 0, "duplicatedLines": 0, "duplicatedBlocks": 0,
+            "duplicatedLinesDensity": 0.0, "criticalIssues": 0, "majorIssues": 0, "minorIssues": 0,
+            "lastAnalysisDate": datetime.now().isoformat()
+        },
+        "tests": {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0, "executionTime": 0.0},
+        "qualityGate": {"status": "UNKNOWN", "conditions": []},
+        "issues_list": []
+    }
+    
+    if not token or not project_key:
+        print("[WARN] SonarCloud parameters missing. Falling back to default values.")
+        return sonar_data
+
+    try:
+        # 1. Fetch Global Component Measures
+        measures_url = f"https://sonarcloud.io/api/measures/component?component={urllib.parse.quote(project_key)}&metricKeys={metric_keys}"
+        req = urllib.request.Request(measures_url)
+        req.add_header("Authorization", f"Bearer {token}")
+        
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            measures = data.get("component", {}).get("measures", [])
+            
+            failures, errors = 0, 0
+            for m in measures:
+                key, val = m.get("metric"), m.get("value")
+                if not val: continue
+                
+                if key == "coverage": sonar_data["summary"]["overallLineCoverage"] = float(val)
+                elif key == "branch_coverage": sonar_data["summary"]["overallBranchCoverage"] = float(val)
+                elif key == "bugs": sonar_data["summary"]["bugs"] = int(val)
+                elif key == "vulnerabilities": sonar_data["summary"]["vulnerabilities"] = int(val)
+                elif key == "code_smells": sonar_data["summary"]["codeSmells"] = int(val)
+                elif key == "security_hotspots": sonar_data["summary"]["securityHotspots"] = int(val)
+                elif key == "duplicated_lines": sonar_data["summary"]["duplicatedLines"] = int(val)
+                elif key == "duplicated_blocks": sonar_data["summary"]["duplicatedBlocks"] = int(val)
+                elif key == "duplicated_lines_density": sonar_data["summary"]["duplicatedLinesDensity"] = float(val)
+                elif key == "sqale_index": sonar_data["summary"]["technicalDebtMinutes"] = int(val)
+                elif key == "tests": sonar_data["tests"]["total"] = int(val)
+                elif key == "test_failures": failures = int(val)
+                elif key == "test_errors": errors = int(val)
+                elif key == "skipped_tests": sonar_data["tests"]["skipped"] = int(val)
+                elif key == "test_execution_time": sonar_data["tests"]["executionTime"] = round(float(val) / 1000.0, 2)
+                elif key == "security_rating": sonar_data["summary"]["securityRating"] = chr(64 + int(float(val)))
+                elif key == "reliability_rating": sonar_data["summary"]["reliabilityRating"] = chr(64 + int(float(val)))
+                elif key == "sqale_rating": sonar_data["summary"]["maintainabilityRating"] = chr(64 + int(float(val)))
+                elif key == "quality_gate_details":
+                    try:
+                        qg = json.loads(val)
+                        sonar_data["qualityGate"]["status"] = qg.get("level", "UNKNOWN")
+                        for cond in qg.get("conditions", []):
+                            sonar_data["qualityGate"]["conditions"].append({
+                                "metric": cond.get("metric"),
+                                "actual": float(cond.get("value", 0)),
+                                "threshold": float(cond.get("errorThreshold", 0)),
+                                "status": "PASS" if cond.get("status") == "OK" else "FAIL"
+                            })
+                    except: pass
+
+            sonar_data["tests"]["failed"] = failures
+            sonar_data["tests"]["errors"] = errors
+            sonar_data["tests"]["passed"] = max(0, sonar_data["tests"]["total"] - (failures + errors + sonar_data["tests"]["skipped"]))
+
+        # 2. Fetch Open Code Issues with explicit Rule Definitions dictionary maps
+        issues_url = f"https://sonarcloud.io/api/issues/search?componentKeys={urllib.parse.quote(project_key)}&statuses=OPEN,REOPENED&ps=100"
+        req_issues = urllib.request.Request(issues_url)
+        req_issues.add_header("Authorization", f"Bearer {token}")
+        
+        with urllib.request.urlopen(req_issues) as response:
+            data = json.loads(response.read().decode())
+            
+            # Map rule details from the global metadata block response array
+            rules_metadata = {r["key"]: r for r in data.get("rules", [])}
+            
+            for issue in data.get("issues", []):
+                severity = issue.get("severity", "MINOR")
+                if severity == "CRITICAL": sonar_data["summary"]["criticalIssues"] += 1
+                elif severity == "MAJOR": sonar_data["summary"]["majorIssues"] += 1
+                elif severity == "MINOR": sonar_data["summary"]["minorIssues"] += 1
+                
+                rule_key = issue.get("rule", "")
+                matched_rule = rules_metadata.get(rule_key, {})
+                
+                # Derive descriptive recommendations and clean software rulesets
+                rule_name = matched_rule.get("name", "Standard Sonar Quality Verification Check")
+                impact_desc = issue.get("cleanCodeAttributeCategory", matched_rule.get("cleanCodeAttributeCategory", "Intentional Quality Standard"))
+                
+                sonar_data["issues_list"].append({
+                    "issueKey": issue.get("key"),
+                    "file": issue.get("component", "").split(":")[-1],
+                    "line": issue.get("line", 0),
+                    "ruleKey": rule_key,
+                    "ruleName": rule_name,
+                    "type": issue.get("type"),
+                    "severity": severity,
+                    "status": issue.get("status"),
+                    "message": issue.get("message"),
+                    "impact": f"Category: {impact_desc} - May lead to downstream runtime regression or structural code smells.",
+                    "sonarcloudRecommendation": f"Refactor code logic at line {issue.get('line', 0)} to satisfy rule: [{rule_name}]. Ensure appropriate guard clauses or patterns are implemented.",
+                    "effortMinutes": int(issue.get("debt", "0min").replace("min", "") or 0),
+                    "tags": issue.get("tags", [])
+                })
+    except Exception as e:
+        print(f"[WARN] Error collecting live SonarCloud analysis data: {e}")
+        
+    return sonar_data
+
+def parse_jacoco(xml_path):
+    modules = []
+    java_metrics = {
+        "lineCoverage": 0.0, "branchCoverage": 0.0, "instructionCoverage": 0.0,
+        "methodCoverage": 0.0, "classCoverage": 0.0,
+        "linesCovered": 0, "linesMissed": 0, "branchesCovered": 0, "branchesMissed": 0
+    }
+    if not xml_path or not os.path.exists(xml_path):
+        return java_metrics, modules
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        for package in root.findall(".//package"):
+            p_name = package.get("name", "")
+            for sf in package.findall("./sourcefile"):
+                name = sf.get("name")
+                cov_lines, mis_lines, cov_br, mis_br = 0, 0, 0, 0
+                for counter in sf.findall("./counter"):
+                    c_type = counter.get("type")
+                    if c_type == "LINE":
+                        cov_lines, mis_lines = int(counter.get("covered", 0)), int(counter.get("missed", 0))
+                    elif c_type == "BRANCH":
+                        cov_br, mis_br = int(counter.get("covered", 0)), int(counter.get("missed", 0))
+                
+                total_ln = cov_lines + mis_lines
+                total_br = cov_br + mis_br
+                if total_ln == 0:
+                    l_cov, b_cov = 100.0, 100.0
+                    status, risk, color = "HEALTHY", "LOW", "GREEN"
+                else:
+                    l_cov = (cov_lines / total_ln * 100.0)
+                    b_cov = (cov_br / total_br * 100.0) if total_br > 0 else 0.0
+                    status = "HEALTHY" if l_cov >= 80 else ("WARNING" if l_cov >= 40 else "CRITICAL")
+                    risk = "LOW" if l_cov >= 80 else ("MEDIUM" if l_cov >= 40 else "HIGH")
+                    color = "GREEN" if l_cov >= 80 else ("YELLOW" if l_cov >= 40 else "RED")
+                
+                modules.append({
+                    "name": name, "path": f"src/main/java/{p_name}/{name}", "language": "Java",
+                    "lineCoverage": round(l_cov, 2), "branchCoverage": round(b_cov, 2),
+                    "coveredLines": cov_lines, "missedLines": mis_lines,
+                    "coveredBranches": cov_br, "missedBranches": mis_br,
+                    "status": status, "riskLevel": risk, "heatmapColor": color
+                })
+        for counter in root.findall("./counter"):
+            c_type, c_cov, c_mis = counter.get("type"), int(counter.get("covered", 0)), int(counter.get("missed", 0))
+            tot = c_cov + c_mis
+            rate = (c_cov / tot * 100.0) if tot > 0 else 0.0
+            if c_type == "LINE":
+                java_metrics["lineCoverage"] = round(rate, 2)
+                java_metrics["linesCovered"], java_metrics["linesMissed"] = c_cov, c_mis
+            elif c_type == "BRANCH":
+                java_metrics["branchCoverage"] = round(rate, 2)
+                java_metrics["branchesCovered"], java_metrics["branchesMissed"] = c_cov, c_mis
+            elif c_type == "INSTRUCTION": java_metrics["instructionCoverage"] = round(rate, 2)
+            elif c_type == "METHOD": java_metrics["methodCoverage"] = round(rate, 2)
+            elif c_type == "CLASS": java_metrics["classCoverage"] = round(rate, 2)
+    except Exception as e:
+        print(f"[ERROR] JaCoCo Parsing Exception: {e}")
+    return java_metrics, modules
+
+def parse_cobertura(xml_path):
+    modules = []
+    cpp_metrics = {
+        "lineCoverage": 0.0, "branchCoverage": 0.0, "functionCoverage": 0.0,
+        "linesCovered": 0, "linesMissed": 0, "branchesCovered": 0, "branchesMissed": 0
+    }
+    if not xml_path or not os.path.exists(xml_path):
+        return cpp_metrics, modules
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        cpp_metrics["lineCoverage"] = round(float(root.get("line-rate", 0.0)) * 100.0, 2)
+        cpp_metrics["branchCoverage"] = round(float(root.get("branch-rate", 0.0)) * 100.0, 2)
+        total_funcs, covered_funcs = 0, 0
+        for cls in root.findall(".//class"):
+            filename = cls.get("filename", "")
+            name = filename.split("/")[-1].split("\\")[-1] if filename else cls.get("name", "")
+            if name.lower().endswith('.cc'):
+                continue
+            l_rate = float(cls.get("line-rate", 0.0)) * 100.0
+            b_rate = float(cls.get("branch-rate", 0.0)) * 100.0
+            cov_l, mis_l, cov_b, mis_b = 0, 0, 0, 0
+            lines_node = cls.find("./lines")
+            if lines_node is not None:
+                for line in lines_node.findall("./line"):
+                    if int(line.get("hits", 0)) > 0: cov_l += 1
+                    else: mis_l += 1
+                    if line.get("branch") == "true":
+                        b_cov = line.get("condition-coverage")
+                        if b_cov and "(" in b_cov:
+                            try:
+                                ratio = b_cov.split("(")[-1].replace(")", "").split("/")
+                                cov_b += int(ratio[0])
+                                mis_b += (int(ratio[1]) - int(ratio[0]))
+                            except: pass
+            for method in cls.findall(".//method"):
+                total_funcs += 1
+                if float(method.get("line-rate", 0.0)) > 0.0: covered_funcs += 1
+
+            cpp_metrics["linesCovered"] += cov_l
+            cpp_metrics["linesMissed"] += mis_l
+            cpp_metrics["branchesCovered"] += cov_b
+            cpp_metrics["branchesMissed"] += mis_b
+            
+            if (cov_l + mis_l) == 0:
+                l_rate, b_rate = 100.0, 100.0
+                status, risk, color = "HEALTHY", "LOW", "GREEN"
+            else:
+                status = "HEALTHY" if l_rate >= 80 else ("WARNING" if l_rate >= 40 else "CRITICAL")
+                risk = "LOW" if l_rate >= 80 else ("MEDIUM" if l_rate >= 40 else "HIGH")
+                color = "GREEN" if l_rate >= 80 else ("YELLOW" if l_rate >= 40 else "RED")
+                
+            modules.append({
+                "name": name, "path": filename, "language": "C++",
+                "lineCoverage": round(l_rate, 2), "branchCoverage": round(b_rate, 2),
+                "coveredLines": cov_l, "missedLines": mis_l,
+                "coveredBranches": cov_b, "missedBranches": mis_b,
+                "status": status, "riskLevel": risk, "heatmapColor": color
+            })
+        cpp_metrics["functionCoverage"] = round((covered_funcs / total_funcs * 100.0), 2) if total_funcs > 0 else 100.0
+    except Exception as e:
+        print(f"[ERROR] Cobertura C++ Parsing Exception: {e}")
+    return cpp_metrics, modules
+
+def main():
+    java_xml = os.environ.get("JAVA_XML_PATH", "java-app/Java/JavaFullstackEcommerce/target/site/jacoco/jacoco.xml")
+    cpp_xml = os.environ.get("CPP_XML_PATH", "cpp-app/build/coverage.xml")
+    
+    java_metrics, java_modules = parse_jacoco(java_xml)
+    cpp_metrics, cpp_modules = parse_cobertura(cpp_xml)
+    sonar = fetch_sonarcloud_data()
+    
+    all_modules = java_modules + cpp_modules
+    total_files = len(all_modules)
+    
+    covered_files = sum(1 for m in all_modules if m["lineCoverage"] >= 80.0)
+    partially_covered = sum(1 for m in all_modules if 0.0 < m["lineCoverage"] < 80.0)
+    uncovered_files = sum(1 for m in all_modules if m["lineCoverage"] == 0.0)
+    
+    overall_line = sonar["summary"]["overallLineCoverage"] or (round(((java_metrics["lineCoverage"] + cpp_metrics["lineCoverage"]) / 2), 2) if total_files > 0 else 0.0)
+    overall_branch = sonar["summary"]["overallBranchCoverage"] or (round(((java_metrics["branchCoverage"] + cpp_metrics["branchCoverage"]) / 2), 2) if total_files > 0 else 0.0)
+
+    # Master schema containing both repositories 
+    unified_json = {
+        "repositories": [
+            {
+                "name": os.environ.get("JAVA_PROJECT_NAME", "sportscenter-java-backend"),
+                "url": os.environ.get("JAVA_GIT_URL", "https://github.com/example/sportscenter-java"),
+                "branch": os.environ.get("JAVA_GIT_BRANCH", "main"),
+                "language": "Java"
+            },
+            {
+                "name": os.environ.get("CPP_PROJECT_NAME", "sportscenter-cpp-engine"),
+                "url": os.environ.get("CPP_GIT_URL", "https://github.com/example/sportscenter-cpp"),
+                "branch": os.environ.get("CPP_GIT_BRANCH", "main"),
+                "language": "C++"
+            }
+        ],
+        "build": {
+            "buildNumber": int(os.environ.get("BUILD_NUMBER", 1)),
+            "status": os.environ.get("BUILD_STATUS", "SUCCESS"),
+            "triggeredBy": os.environ.get("BUILD_USER", "Jenkins System"),
+            "commitId": os.environ.get("GIT_COMMIT", "e4cd859")[:7],
+            "commitMessage": os.environ.get("COMMIT_MESSAGE", "Added coverage parser improvements"),
+            "author": os.environ.get("COMMIT_AUTHOR", "Shraddha Deshmukh"),
+            "startTime": os.environ.get("BUILD_START_TIME", datetime.now().isoformat()),
+            "endTime": datetime.now().isoformat(),
+            "durationSeconds": int(os.environ.get("BUILD_DURATION_SECONDS", 0))
+        },
+        "summary": {
+            "overallLineCoverage": overall_line,
+            "overallBranchCoverage": overall_branch,
+            "javaCoverage": java_metrics["lineCoverage"],
+            "cppCoverage": cpp_metrics["lineCoverage"],
+            "totalFiles": total_files,
+            "coveredFiles": covered_files,
+            "partiallyCoveredFiles": partially_covered,
+            "uncoveredFiles": uncovered_files,
+            "totalTests": sonar["tests"]["total"],
+            "passedTests": sonar["tests"]["passed"],
+            "failedTests": sonar["tests"]["failed"],
+            "qualityGate": sonar["qualityGate"]["status"]
+        },
+        "java": java_metrics,
+        "cpp": cpp_metrics,
+        "tests": sonar["tests"],
+        "sonar": {
+            "summary": sonar["summary"],
+            "issues": sonar["issues_list"]
+        },
+        "modules": all_modules,
+        "riskRanking": [],
+        "heatmap": [],
+        "qualityGate": sonar["qualityGate"],
+        "artifacts": {
+            "jacocoXml": java_xml,
+            "gcovrXml": cpp_xml,
+            "coverageJson": "cpp-app/build/coverage.json",
+            "sonarUrl": f"https://sonarcloud.io/dashboard?id={os.environ.get('SONAR_PROJECT_KEY','')}"
+        }
+    }
+
+    for m in all_modules:
+        unified_json["riskRanking"].append({
+            "name": m["name"],
+            "language": m["language"],
+            "coverage": m["lineCoverage"],
+            "riskLevel": m["riskLevel"]
+        })
+        unified_json["heatmap"].append({
+            "name": m["name"],
+            "coverage": m["lineCoverage"],
+            "color": m["heatmapColor"]
+        })
+        
+    unified_json["riskRanking"].sort(key=lambda x: x["coverage"])
+    unified_json["heatmap"].sort(key=lambda x: x["coverage"])
+
+    output_path = "unified_master_report.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(unified_json, f, indent=2)
+        
+    print(f"[SUCCESS] Multi-repo analysis complete. Profile generated at: {output_path}")
+
+if __name__ == "__main__":
+    main()
